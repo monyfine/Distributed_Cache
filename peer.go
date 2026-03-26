@@ -10,6 +10,7 @@ import "mony-cache_final/geecachepb"
 // 	// PickPeer 根据传入的 key 选择出对应的远程节点
 // 	PickPeer(key string)(peer PeerGetter,ok bool)
 // }
+
 // PeerPicker 是根据 key 选择节点的接口
 type PeerPicker interface {
 	PickPeer(key string) (peer PeerGetter, ok bool)

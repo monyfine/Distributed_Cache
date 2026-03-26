@@ -58,6 +58,7 @@ func (c *Cache)Get(key string)(value Value,ok bool){
 		//所以需要 "类型断言" 把它还原回来！
 		kv := ele.Value.(*entry)// 假设你链表里存的是 *entry 指针
 		// 🌟 核心拦截机制：如果他有死期，并且现在的时间已经超过了死期
+		//TTL
 		if !kv.expireAT.IsZero()&&time.Now().After(kv.expireAT){
 			// 哎呀，已经过期了！
 			c.removeElement(ele) // 用狙击枪把他精准干掉
