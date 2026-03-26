@@ -3,7 +3,10 @@ package monycachefinal
 import (
 	"fmt"
 	"log"
+	"mony-cache_final/geecachepb"
+	"mony-cache_final/singleflight"
 	"sync"
+	"time"
 )
 
 // 回调接口：如果缓存没有，就调用这个接口的 Get 方法去源头找
@@ -20,39 +23,48 @@ type GetterFunc func(key string) ([]byte, error)
 func (f GetterFunc) Get(key string) ([]byte, error) {
 	return f(key)
 }
+
 // -----------------------------------------------------
 
-
 // 它是用户直接交互的对象。每个 Group 应该有一个名字，和一个具体的缓存实现。
-type Group struct{
-	name string// 组名，比如 "scores"
+type Group struct {
+	name      string // 组名，比如 "scores"
 	getter    Getter // 👈 新增这一行：缓存未命中时获取源数据的回调(callback)
-	mainCache cache// 具体的缓存实现（封装了你写的 LRU）
+	mainCache cache  // 具体的缓存实现（封装了你写的 LRU）
 
 	// --- 👇 新增这一行：分发路由的指南针 👇 ---
-	peers     PeerPicker 
+	peers PeerPicker
+
+	// 🌟 新增装备：使用 singleflight 防击穿
+	loader *singleflight.Group
+
+	// 🌟 新装备：这个群组里所有缓存的统一过期时间
+	ttl       time.Duration 
 }
+
 /*
 我们需要一个全局变量，把所有创建出来的 Group 都存起来，这样 http.go 才能通过名字找到它们。
 逻辑：用一个 map 来存，Key 是组名，Value 是 Group 的指针。
 注意：因为会有很多人同时查，所以还得配一把读写锁（sync.RWMutex）。
 */
-var(
-	mu 	sync.RWMutex
+var (
+	mu     sync.RWMutex
 	groups = make(map[string]*Group)
 )
+
 /*
 实现 GetGroup 函数（档案查询员）
 加上读锁（RLock），因为我们只是看一眼，不修改。
 从全局 groups 地图里按名字找。
 返回找到的那个 Group 指针。
 */
-func GetGroup(name string)*Group{
+func GetGroup(name string) *Group {
 	mu.RLock()
 	g := groups[name]
 	mu.RUnlock()
 	return g
 }
+
 /*
 实现 NewGroup 函数（档案登记处）
 用户想创建一个新缓存组时调用它。
@@ -78,16 +90,24 @@ func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
 	// 1. 实例化一个全新的 Group
 	g := &Group{
 		name:      name,
-		getter:    getter, // 👈 把传进来的 getter 组装进去
+		getter:    getter,                        // 👈 把传进来的 getter 组装进去
 		mainCache: cache{cacheBytes: cacheBytes}, // 把刚刚说的“保安室”初始化一下
+		loader:    &singleflight.Group{},         // 🌟 给新装备发弹药
+		ttl:  5 * time.Minute, 					  // 🌟 默认值：5分钟后过期
 	}
-	
+
 	// 2. 登记到全局地图里
 	groups[name] = g
-	
+
 	// 3. 把造好的 Group 交出去
 	return g
 }
+
+// 🌟 进阶亮点：提供一个修改 TTL 的方法（让用户可以自己定）
+func (g *Group) SetTTL(d time.Duration) {
+	g.ttl = d
+}
+
 // Get 方法：前台接待员(http.go)就是靠调用这个方法来拿数据的！
 // 返回值有两个：我们刚写好的 ByteView 包装盒，以及 error 错误信息
 func (g *Group) Get(key string) (ByteView, error) {
@@ -102,7 +122,7 @@ func (g *Group) Get(key string) (ByteView, error) {
 	if v, ok := g.mainCache.get(key); ok {
 		// 如果找到了 (ok 为 true)
 		// 恭喜！缓存命中了！直接把拿到的 v 返回出去，错误填 nil
-		return v.(ByteView),nil
+		return v.(ByteView), nil
 	}
 
 	// 3. 兜底：如果保安室没找到。
@@ -111,36 +131,52 @@ func (g *Group) Get(key string) (ByteView, error) {
 
 	// 2. 缓存没命中 (miss)，我们要开启“加载模式”
 	// 我们写一个新方法叫 load(key)，专门负责把数据搞回来
-	return g.load(key) 
+	return g.load(key)
 }
-func (g *Group)load(key string)(value ByteView,err error){
-	// 1. 看看咱们有没有注册过“指南针”（peers）
-	if g.peers != nil{
-		// 2. 调用指南针的 PickPeer(key) 方法，算一算这东西归谁管
-		if peer,ok := g.peers.PickPeer(key); ok{
-			// 3. 【重点】既然 ok 为 true，说明算出是“别人”家管。
-			// 我们写一个新方法 getFromPeer(peer, key) 派人去拿数据
-			if value,err = g.getFromPeer(peer,key);err == nil{
-				return value,nil
+func (g *Group) load(key string) (value ByteView, err error) {
+	// 🌟 魔法降临：把原本的逻辑用 loader.Do 包裹！
+	// 注意：返回值是 interface{}，需要类型转换一下
+	viewi, err := g.loader.Do(key, func() (interface{}, error) {
+		// 1. 看看咱们有没有注册过“指南针”（peers）
+		if g.peers != nil {
+			// 2. 调用指南针的 PickPeer(key) 方法，算一算这东西归谁管
+			if peer, ok := g.peers.PickPeer(key); ok {
+				// 3. 【重点】既然 ok 为 true，说明算出是“别人”家管。
+				// 我们写一个新方法 getFromPeer(peer, key) 派人去拿数据
+				if value, err = g.getFromPeer(peer, key); err == nil {
+					return value, nil
+				}
+
+				log.Println("[GeeCache] 跨站抓取失败，准备尝试本地读取:", err)
 			}
-
-			log.Println("[GeeCache] 跨站抓取失败，准备尝试本地读取:", err)
 		}
+		// 4. 兜底：如果指南针算出归自己管，或者去别人家拿失败了
+		// 回归老样子：去本地数据库查
+		return g.getLocally(key)
+	})
+	if err == nil {
+		return viewi.(ByteView), nil // 从 interface{} 转回 ByteView
 	}
-	// 4. 兜底：如果指南针算出归自己管，或者去别人家拿失败了
-	// 回归老样子：去本地数据库查
-	return g.getLocally(key)
+	return
 }
 
-func (g *Group)getFromPeer(peer PeerGetter, key string)(ByteView,error){
-	// 1. 这里的 peer 就是咱们在 http.go 里写的那个 httpGetter（跑腿小弟）
-	// 调用他的 Get 方法，顺着网线去抓数据
-	bytes,err :=peer.Get(g.name,key)
-	if err != nil{
-		return ByteView{},err
+func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
+	// 1. 组装 gRPC 认识的请求对象
+	req := &geecachepb.GetRequest{
+		Group: g.name,
+		Key:   key,
 	}
-	return ByteView{b:bytes},nil
+	// 2. 准备一个空的响应对象接数据
+	res := &geecachepb.GetResponse{}
+
+	// 🌟 核心：只传这两个 pb 对象，不再传 g.name 和 key 了！
+	err := peer.Get(req, res)
+	if err != nil {
+		return ByteView{}, err
+	}
+	return ByteView{b: res.Value}, nil
 }
+
 /*
 调用 g.getter.Get(key) 拿到原始字节 bytes。
 万一数据库里也没有（err != nil），直接把错误甩出去。
@@ -153,18 +189,19 @@ func (g *Group) getLocally(key string) (ByteView, error) {
 	if err != nil {
 		return ByteView{}, err
 	}
-	
+
 	// 2. 将数据包装成 ByteView
 	value := ByteView{b: cloneBytes(bytes)} // 记得做一次深拷贝，保护数据
-	
+
 	// 3. 存入缓存，下次就快了
 	g.populateCache(key, value)
-	
+
 	return value, nil
 }
+
 // 这个方法最简单，就是去调用保安室的 add。
 func (g *Group) populateCache(key string, value ByteView) {
-	g.mainCache.add(key, value)
+	g.mainCache.add(key, value, g.ttl)
 }
 
 // RegisterPeers 注册一个 PeerPicker，用来选择远程节点

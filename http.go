@@ -2,9 +2,10 @@ package monycachefinal
 
 import (
 	"fmt"
-	"io"
+	"io/ioutil"
 	"log"
 	"mony-cache_final/consistenthash"
+	"mony-cache_final/geecachepb"
 	"net/http"
 	"net/url"
 	"strings"
@@ -140,35 +141,35 @@ type httpGetter struct {
 	baseURL string // 目标节点的地址，比如 "http://localhost:10002/_geecache/"
 }
 
-func (h *httpGetter)Get(group string,key string)([]byte,error){
-	// 1. 拼接他要去的那个网站地址
-	// url.QueryEscape 可以防止有些客人的 key 里面有特殊符号（比如 ? 或 &）导致网址崩溃
-	u :=fmt.Sprintf(
+// 🌟 强行让它接收 Protobuf 的请求和响应
+func (h *httpGetter) Get(in *geecachepb.GetRequest, out *geecachepb.GetResponse) error {
+	// 从 pb 对象里解剖出 group 和 key
+	u := fmt.Sprintf(
 		"%v%v/%v",
 		h.baseURL,
-		url.QueryEscape(group),
-		url.QueryEscape(key),
+		url.QueryEscape(in.GetGroup()),
+		url.QueryEscape(in.GetKey()),
 	)
-
-	// 2. 顺着网线发起 HTTP GET 请求，去别人的前台接待员那里要数据！
-	res,err := http.Get(u)
-	if err != nil{
-		return nil,err// 路上摔跤了（网络不通），赶紧把错误带回来
+	
+	res, err := http.Get(u)
+	if err != nil {
+		return err
 	}
-	// 3. 良好习惯：不管拿没拿到，用完必须要关掉这个网络连接的门
 	defer res.Body.Close()
-	// 4. 判断一下对方给没给好脸（状态码是不是 200 OK）
-	if res.StatusCode != http.StatusOK{
-		return nil,fmt.Errorf("对方节点报错了: %v", res.Status)
+
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("server returned: %v", res.Status)
 	}
-	// 5. 对方同意给了，咱们把信封（Body）里的东西全读出来
-	bytes,err := io.ReadAll(res.Body)
-	if err != nil{
-		return nil, fmt.Errorf("读取对方的数据失败: %v", err)
+
+	bytes, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		return fmt.Errorf("reading response body: %v", err)
 	}
-	// 6. 完美收工，带着原始数据回家交差！
-	return bytes,nil
+
+	// 🌟 把拿到的字节塞进 pb 对象的 Value 里
+	out.Value = bytes
+	return nil
 }
 // 强制类型检查：如果 httpGetter 没有完美实现 PeerGetter 接口的 Get 方法，
 // Go 编译器在这里就会直接报错！这是一层保险。
-var _ PeerGetter = (*httpGetter)(nil)
+// var _ PeerGetter = (*httpGetter)(nil)

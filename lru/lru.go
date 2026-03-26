@@ -1,6 +1,10 @@
 package lru
 
-import "container/list"
+import (
+	"container/list"
+	"time"
+)
+
 // 1. 只要实现了 Len() int 的类型，都能作为缓存的值
 type Value interface{
 	Len() int
@@ -9,7 +13,9 @@ type Value interface{
 type entry struct{
 	key   string
 	value Value
+	expireAT time.Time// 🌟 新增：过期时间（如果不设置就是默认零值，代表永久）
 }
+
 type Cache struct{
 	maxBytes int64
 	nBytes   int64
@@ -29,18 +35,37 @@ func New(maxBytes int64,onEvicted func(string,Value))*Cache{
 		onEvicted: onEvicted,
 	}
 }
+// 🌟 新增的“狙击枪”：专门踢掉指定的某个节点
+func (c *Cache) removeElement(ele *list.Element) {
+	if ele != nil{
+		c.ll.Remove(ele)
+		kv := ele.Value.(*entry)
+		delete(c.cache,kv.key)
+		c.nBytes -= int64(len(kv.key)) + int64(kv.value.Len())// 扣减内存
+		//不理解,不理解onEvicted这个东西
+		if c.onEvicted != nil {
+			c.onEvicted(kv.key,kv.value)// 通知人事总监
+		}
+	}
+}
 // 注意这里！把 c *Cache 写在括号里，表示这是 Cache 的方法！首字母 G 大写表示对外暴露！
 func (c *Cache)Get(key string)(value Value,ok bool){
     // 1. 在 Go 里，查字典的黄金法则叫 "comma-ok 断言"
     // ele 就是 *list.Element
 	if ele ,ok := c.cache[key]; ok{
-        // 2. 既然找到了，把这个节点移到队头（代表最近使用）
-        // 填空：调用 c.ll 的什么方法？参数传什么？
-		c.ll.MoveToFront(ele)
         // 3. 难点来了：怎么把 Value 拿出来？
         // ele.Value 存的是任意类型 (any/interface{})，在我们的设计里，里面装的是 *entry 或 entry 结构体
 		//所以需要 "类型断言" 把它还原回来！
 		kv := ele.Value.(*entry)// 假设你链表里存的是 *entry 指针
+		// 🌟 核心拦截机制：如果他有死期，并且现在的时间已经超过了死期
+		if !kv.expireAT.IsZero()&&time.Now().After(kv.expireAT){
+			// 哎呀，已经过期了！
+			c.removeElement(ele) // 用狙击枪把他精准干掉
+			return nil, false    // 告诉外面没查到
+		}
+        // 2. 既然找到了，把这个节点移到队头（代表最近使用）
+        // 填空：调用 c.ll 的什么方法？参数传什么？
+		c.ll.MoveToFront(ele)		
 		return kv.value,true
 	}
     // 5. 如果没找到，返回什么都不做（此时 value 和 ok 自动是它们类型的零值，也就是 nil 和 false）
@@ -53,33 +78,15 @@ func (c *Cache) RemoveOldest() {
 	// 1. 去链表尾部抓那个最老的节点 (调用 c.ll 的 Back 方法)
 	ele := c.ll.Back()
 	
-	// 2. 必须判断有没有抓到人（缓存是不是空的）
-	if ele != nil {
-		// 3. 把人从链表（队伍）里踢掉 (调用 c.ll 的 Remove 方法)
-		c.ll.Remove(ele)
-		
-		// 4. 把节点里的数据解剖出来（类型断言），我们需要它的名字（key）去查 map
-		// 因为链表里存的是 *entry，所以要断言
-		kv := ele.Value.(*entry)
-		
-		// 5. 从 map 里彻底删除！使用 Go 的内置函数 delete
-		// 语法：delete(你的map, 要删的key)
-		//delete(你的字典名字, 你要删的键名)
-		delete(c.cache,kv.key)
-		
-		// 6. 维护公司剩余容量：当前已用内存 减去 (这个 key 的长度 + value 的 Len())
-		// 提示：用 len(kv.key) 获取 key 的长度，注意要转成 int64
-		c.nBytes -= int64(len(kv.key)) + int64(kv.value.Len())
-		
-		// 7. 如果有人事总监（onEvicted 不为 nil），就通知他这个人被开了
-		//不理解
-		if c.onEvicted != nil {
-			c.onEvicted(kv.key, kv.value)
-		}
-	}
+	c.removeElement(ele)// 直接开枪
 }
 
-func (c *Cache)Add(key string,value Value){
+func (c *Cache)Add(key string,value Value,ttl time.Duration){
+	// 🌟 计算死期
+	var expire time.Time
+	if ttl > 0 {
+		expire = time.Now().Add(ttl) // 当前时间 + 存活时间
+	}
 	if ele,ok := c.cache[key]; ok{
 		// --- 场景 A：Key 已存在（更新） ---
 		// 1. 把节点移到最前面（最近被使用）
@@ -91,9 +98,10 @@ func (c *Cache)Add(key string,value Value){
 		// c.cache[key]=c.ll.Front()
 		//这个不用更新 这个 ele 指向的内存地址（指针值）从始至终都没有变！ 它还是原来那个节点对象，只是它在链表里的位置变了。
 		kv.value=value
+		kv.expireAT = expire
 	}else{
 		// ！！！注意这里：存入的是整个 entry 的指针 ！！！
-		ele := c.ll.PushFront(&entry{key,value})
+		ele := c.ll.PushFront(&entry{key,value,expire})
 		c.cache[key] = ele
 		// 重点！重点！重点！
 		// key 是字符串，用内置函数 len(key)
