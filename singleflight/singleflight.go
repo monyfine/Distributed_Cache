@@ -27,23 +27,23 @@ func (g *Group) Do(key string, fn func() (interface{}, error)) (interface{}, err
 	// 1. 如果这个 key 已经在账本里了（说明有人已经去查了）
 	if c, ok := g.m[key]; ok {
 		g.mu.Unlock() // 赶紧释放锁，让别人也能来查账本
-		c.wg.Wait()   // 🌟 核心：我就坐在这儿死等，直到那个人把数据拿回来
+		c.wg.Wait()   // 我就坐在这儿死等，直到那个人把数据拿回来
 		return c.val, c.err
 	}
 
 	// 2. 如果账本里没有这个 key（说明我是第一个来的）
 	c := new(call)
-	c.wg.Add(1)  // 🌟 告诉后来的人：我已经出发了，你们等我
-	g.m[key] = c // 在账本上登记：这个 key 我承包了
-	g.mu.Unlock() // 登记完，释放账本的锁
+	c.wg.Add(1)
+	g.m[key] = c
+	g.mu.Unlock()
 
 	// 3. 真正去调用传进来的函数（比如去查数据库），这个过程可能很慢
 	c.val, c.err = fn()
-	c.wg.Done() // 🌟 查完了！回来大喊一声：我搞定了，等我的人都可以拿数据了！
+	c.wg.Done()
 
 	// 4. 清理账本
 	g.mu.Lock()
-	delete(g.m, key) // 任务完成，从账本上划掉这个 key
+	delete(g.m, key)
 	g.mu.Unlock()
 
 	return c.val, c.err

@@ -39,7 +39,6 @@ func (m *Map) Add(keys ...string) {
 	for _, key := range keys {
 		for i := 0; i < m.replicas; i++ {
 			// 3. 必须用 strconv.Itoa，把 i 变成 "0", "1", "2"
-			// 4. 调用 m.hash 而不是写死 crc32
 			hashValue := int(m.hash([]byte(strconv.Itoa(i)+key)))
 			// 5. 将虚拟节点的哈希值加到环上
 			m.keys = append(m.keys, hashValue)

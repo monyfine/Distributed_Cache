@@ -35,11 +35,10 @@ type Group struct {
 	// --- 👇 新增这一行：分发路由的指南针 👇 ---
 	peers PeerPicker
 
-	// 🌟 新增装备：使用 singleflight 防击穿
 	loader *singleflight.Group
 
 	// 🌟 新装备：这个群组里所有缓存的统一过期时间
-	ttl       time.Duration 
+	ttl time.Duration
 }
 
 /*
@@ -85,15 +84,15 @@ func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
 		panic("nil Getter")
 	}
 	mu.Lock()
-	defer mu.Unlock() // 习惯性加上 defer，防止中间报错导致死锁
+	defer mu.Unlock()
 
 	// 1. 实例化一个全新的 Group
 	g := &Group{
 		name:      name,
-		getter:    getter,                        // 👈 把传进来的 getter 组装进去
-		mainCache: cache{cacheBytes: cacheBytes}, // 把刚刚说的“保安室”初始化一下
-		loader:    &singleflight.Group{},         // 🌟 给新装备发弹药
-		ttl:  5 * time.Minute, 					  // 🌟 默认值：5分钟后过期
+		getter:    getter,
+		mainCache: cache{cacheBytes: cacheBytes},
+		loader:    &singleflight.Group{},
+		ttl:       5 * time.Minute,
 	}
 
 	// 2. 登记到全局地图里
@@ -103,10 +102,9 @@ func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
 	return g
 }
 
-// 🌟 进阶亮点：提供一个修改 TTL 的方法（让用户可以自己定）
-func (g *Group) SetTTL(d time.Duration) {
-	g.ttl = d
-}
+// func (g *Group) SetTTL(d time.Duration) {
+// 	g.ttl = d
+// }
 
 // Get 方法：前台接待员(http.go)就是靠调用这个方法来拿数据的！
 // 返回值有两个：我们刚写好的 ByteView 包装盒，以及 error 错误信息
@@ -120,28 +118,21 @@ func (g *Group) Get(key string) (ByteView, error) {
 	// 2. 找保安拿数据：调用咱们结构体里的 mainCache (保安室) 的 get 方法
 	// 接收返回值 v (数据) 和 ok (是否找到的布尔值)
 	if v, ok := g.mainCache.get(key); ok {
-		// 如果找到了 (ok 为 true)
-		// 恭喜！缓存命中了！直接把拿到的 v 返回出去，错误填 nil
+		//命中
 		return v.(ByteView), nil
 	}
 
-	// 3. 兜底：如果保安室没找到。
-	// 正常的分布式缓存这里应该“触发回调函数去数据库查”，但咱们今天先从简，直接返回报错
-	// return ByteView{}, fmt.Errorf("缓存没命中，找不到这个键: %s", key)
-
-	// 2. 缓存没命中 (miss)，我们要开启“加载模式”
+	// 3. 缓存没命中 (miss)，我们要开启“加载模式”
 	// 我们写一个新方法叫 load(key)，专门负责把数据搞回来
 	return g.load(key)
 }
 func (g *Group) load(key string) (value ByteView, err error) {
-	// 🌟 魔法降临：把原本的逻辑用 loader.Do 包裹！
 	// 注意：返回值是 interface{}，需要类型转换一下
 	viewi, err := g.loader.Do(key, func() (interface{}, error) {
-		// 1. 看看咱们有没有注册过“指南针”（peers）
 		if g.peers != nil {
 			// 2. 调用指南针的 PickPeer(key) 方法，算一算这东西归谁管
+			//这个pickpeer里面有一致性hash
 			if peer, ok := g.peers.PickPeer(key); ok {
-				// 3. 【重点】既然 ok 为 true，说明算出是“别人”家管。
 				// 我们写一个新方法 getFromPeer(peer, key) 派人去拿数据
 				if value, err = g.getFromPeer(peer, key); err == nil {
 					return value, nil
@@ -151,7 +142,10 @@ func (g *Group) load(key string) (value ByteView, err error) {
 			}
 		}
 		// 4. 兜底：如果指南针算出归自己管，或者去别人家拿失败了
-		// 回归老样子：去本地数据库查
+		//去本地数据库查
+		//为什么这里不直接在外面查完数据库再反回来，数据库一个都是公共的呀
+		//这里不确定是否会前往其他服务器，有可能是属于直接这台服务器但是过期了
+		//就是上一个peers不一定会进去
 		return g.getLocally(key)
 	})
 	if err == nil {
@@ -170,6 +164,7 @@ func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
 	res := &geecachepb.GetResponse{}
 
 	// 🌟 核心：只传这两个 pb 对象，不再传 g.name 和 key 了！
+	//其实这个Get是从其他服务器那里取调用了
 	err := peer.Get(req, res)
 	if err != nil {
 		return ByteView{}, err
@@ -177,14 +172,9 @@ func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
 	return ByteView{b: res.Value}, nil
 }
 
-/*
-调用 g.getter.Get(key) 拿到原始字节 bytes。
-万一数据库里也没有（err != nil），直接把错误甩出去。
-如果拿到了数据，重点来了：我们要把这份新鲜的数据包装成 ByteView。
-最关键的一步：调用一个叫 populateCache 的方法，把数据塞进缓存，这样下次就不用再查数据库了！
-*/
 func (g *Group) getLocally(key string) (ByteView, error) {
 	// 1. 调用回调函数
+	//这里这个getter其实就是main函数里面写的从数据库里读数据
 	bytes, err := g.getter.Get(key)
 	if err != nil {
 		return ByteView{}, err
@@ -194,14 +184,9 @@ func (g *Group) getLocally(key string) (ByteView, error) {
 	value := ByteView{b: cloneBytes(bytes)} // 记得做一次深拷贝，保护数据
 
 	// 3. 存入缓存，下次就快了
-	g.populateCache(key, value)
+	g.mainCache.add(key, value, g.ttl)
 
 	return value, nil
-}
-
-// 这个方法最简单，就是去调用保安室的 add。
-func (g *Group) populateCache(key string, value ByteView) {
-	g.mainCache.add(key, value, g.ttl)
 }
 
 // RegisterPeers 注册一个 PeerPicker，用来选择远程节点
@@ -210,4 +195,83 @@ func (g *Group) RegisterPeers(peers PeerPicker) {
 		panic("RegisterPeerPicker called more than once")
 	}
 	g.peers = peers
+}
+
+func (g *Group) setToPeer(peer PeerGetter, key string, value []byte) error {
+	req := &geecachepb.SetRequest{
+		Group: g.name,
+		Key:   key,
+		Value: value,
+	}
+	res := &geecachepb.SetResponse{}
+	//这里跨服务器去修改
+	err := peer.Set(req, res)
+	if err != nil {
+		return err
+	}
+	if !res.Success {
+		return fmt.Errorf("remote set failed: %s", res.Message)
+	}
+	return nil
+}
+func (g *Group) setLocally(key string, value []byte) {
+	v := ByteView{b: cloneBytes(value)}
+	g.mainCache.add(key, v, g.ttl)
+}
+
+func (g *Group) Set(key string, value []byte) error {
+	//外面保证value一定不为空，这里要保证key一定不为空
+	if key == "" {
+		return fmt.Errorf("key is required")
+	}
+	//这里peers基本上不可能为空，因为他在main函数里面建好了
+	//这里就是个防御性编程，防止万一
+	//如果他为空就是一个纯的本地缓存，就是在main函数那里peers不设置
+	if g.peers != nil {
+		//这里就是直接去环里面找，看是否属于其他服务器
+		if peer, ok := g.peers.PickPeer(key); ok {
+			err := g.setToPeer(peer, key, value)
+			if err != nil {
+				log.Printf("[GeeCache] 跨站写入失败: %v\n", err)
+				return err
+			}
+			return nil
+		}
+	}
+	g.setLocally(key, value)
+	return nil
+}
+
+func (g *Group) deleteFromPeer(peer PeerGetter, key string) error {
+	req := &geecachepb.DeleteRequest{
+		Group: g.name,
+		Key:   key,
+	}
+	res := &geecachepb.DeleteResponse{}
+
+	err := peer.Delete(req, res)
+	if err != nil {
+		return err
+	}
+	if !res.Success {
+		return fmt.Errorf("remote delete failed")
+	}
+	return nil
+}
+func (g *Group) Delete(key string) error {
+	if key == "" {
+		return fmt.Errorf("key is required")
+	}
+	if g.peers != nil {
+		if peer, ok := g.peers.PickPeer(key); ok {
+			err := g.deleteFromPeer(peer, key)
+			if err != nil {
+				log.Printf("[GeeCache] 跨站删除失败: %v\n", err)
+				return err
+			}
+			return nil
+		}
+	}
+	g.mainCache.delete(key)
+	return nil
 }

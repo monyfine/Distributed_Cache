@@ -13,7 +13,7 @@ type Value interface{
 type entry struct{
 	key   string
 	value Value
-	expireAT time.Time// 🌟 新增：过期时间（如果不设置就是默认零值，代表永久）
+	expireAT time.Time
 }
 
 type Cache struct{
@@ -23,7 +23,6 @@ type Cache struct{
 	cache    map[string]*list.Element
 	onEvicted func(key string,value Value)
 }
-
 
 // 4. New 函数（初始化）
 //不理解onEvicted
@@ -35,7 +34,7 @@ func New(maxBytes int64,onEvicted func(string,Value))*Cache{
 		onEvicted: onEvicted,
 	}
 }
-// 🌟 新增的“狙击枪”：专门踢掉指定的某个节点
+//新增的“狙击枪”：专门踢掉指定的某个节点
 func (c *Cache) removeElement(ele *list.Element) {
 	if ele != nil{
 		c.ll.Remove(ele)
@@ -48,28 +47,29 @@ func (c *Cache) removeElement(ele *list.Element) {
 		}
 	}
 }
-// 注意这里！把 c *Cache 写在括号里，表示这是 Cache 的方法！首字母 G 大写表示对外暴露！
+
+func (c *Cache)Remove(key string){
+	if ele,ok := c.cache[key];ok{
+		c.removeElement(ele);
+	}
+}
+
 func (c *Cache)Get(key string)(value Value,ok bool){
     // 1. 在 Go 里，查字典的黄金法则叫 "comma-ok 断言"
     // ele 就是 *list.Element
 	if ele ,ok := c.cache[key]; ok{
-        // 3. 难点来了：怎么把 Value 拿出来？
-        // ele.Value 存的是任意类型 (any/interface{})，在我们的设计里，里面装的是 *entry 或 entry 结构体
-		//所以需要 "类型断言" 把它还原回来！
-		kv := ele.Value.(*entry)// 假设你链表里存的是 *entry 指针
+		kv := ele.Value.(*entry)
 		// 🌟 核心拦截机制：如果他有死期，并且现在的时间已经超过了死期
 		//TTL
 		if !kv.expireAT.IsZero()&&time.Now().After(kv.expireAT){
-			// 哎呀，已经过期了！
 			c.removeElement(ele) // 用狙击枪把他精准干掉
-			return nil, false    // 告诉外面没查到
+			return nil, false
 		}
         // 2. 既然找到了，把这个节点移到队头（代表最近使用）
-        // 填空：调用 c.ll 的什么方法？参数传什么？
 		c.ll.MoveToFront(ele)		
 		return kv.value,true
 	}
-    // 5. 如果没找到，返回什么都不做（此时 value 和 ok 自动是它们类型的零值，也就是 nil 和 false）
+    //5. 如果没找到，返回什么都不做（此时 value 和 ok 自动是它们类型的零值，也就是 nil 和 false）
 	return nil,false
 	//也可以直接写个return
 }

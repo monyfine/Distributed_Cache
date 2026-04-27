@@ -26,8 +26,10 @@ func (c *cache)add(key string, value lru.Value,ttl time.Duration){
 
 	//================================================
 	// 延迟初始化：如果底层的 lru 还没创建，就在这里创建它
+	//这里不用sync.Once是因为一开始这里就加了锁，并且这个函数是用来add的
+	//如果用sycn.Once反而额外增加一次不必要的函数调用和原子性检查开销
 	if c.lru == nil{
-		c.lru = lru.New(c.cacheBytes,nil)// 假设你的 lru.New 接收最大内存和回调函数
+		c.lru = lru.New(c.cacheBytes,nil)
 	}
 
 	// 调用底层真正的 lru 去存数据
@@ -45,4 +47,13 @@ func (c *cache)get(key string)(value lru.Value,ok bool){
 		return v,ok
 	}
 	return nil,false
+}
+
+func (c *cache)delete(key string){
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lru == nil{
+		return
+	}
+	c.lru.Remove(key)
 }

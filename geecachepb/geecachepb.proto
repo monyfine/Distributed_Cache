@@ -1,28 +1,52 @@
-// 说明我们使用的是第 3 版的 protobuf 语法
 syntax = "proto3";
 
 // 给这份契约起个包名
 package geecachepb;
 
-// 🌟 这一行极度重要！告诉编译器：生成的 Go 代码放在哪个相对目录下，包名叫什么
+// 告诉编译器生成的 Go 代码放在哪个包下
 option go_package = "mony-cache_final/geecachepb";
 
-// 1. 定义请求结构体（类似 Go 的 struct）
+// ================= 1. Get (读操作) =================
 message GetRequest {
-  // 注意：这里的 = 1, = 2 不是赋值！而是给字段贴上“位置标签”。
-  // 压缩数据时，它只传标签号 1 和 2，不传变量名，所以体积极小！
-  string group = 1;
-  string key = 2;
+    string group = 1;
+    string key = 2;
 }
 
-// 2. 定义响应结构体
 message GetResponse {
-  // bytes 对应 Go 里面的 []byte
-  bytes value = 1;
+    bytes value = 1;
 }
 
-// 3. 定义服务接口（类似 Go 的 interface）
-// 意思是：我提供一个叫 GroupCache 的服务，里面有个 Get 方法。
+// ================= 2. Set (写操作) =================
+message SetRequest {
+    string group = 1;
+    string key = 2;
+    bytes value = 3;     // 要写入的数据
+    int64 ttl = 4;       // 过期时间（可选，单位可以是秒或毫秒，这里用 int64）
+}
+
+message SetResponse {
+    bool success = 1;    // 是否写入成功
+    string message = 2;  // 附加信息（比如报错时的错误信息）
+}
+
+// ================= 3. Delete (删操作) =================
+message DeleteRequest {
+    string group = 1;
+    string key = 2;
+}
+
+message DeleteResponse {
+    bool success = 1;    // 是否删除成功
+}
+
+// ================= 4. 定义服务接口 =================
 service GroupCache {
-  rpc Get(GetRequest) returns (GetResponse);
+    // 读数据
+    rpc Get(GetRequest) returns (GetResponse);
+    
+    // 写数据
+    rpc Set(SetRequest) returns (SetResponse);
+    
+    //删数据
+    rpc Delete(DeleteRequest) returns (DeleteResponse);
 }

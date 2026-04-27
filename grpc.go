@@ -9,14 +9,8 @@ import (
 	"sync"
 )
 
-// --- 1. 服务端：负责接收别人的请求 ---
 
-type grpcServer struct {
-	geecachepb.UnimplementedGroupCacheServer
-	addr string
-}
-
-func (s *grpcServer) Get(ctx context.Context, in *geecachepb.GetRequest) (*geecachepb.GetResponse, error) {
+func (p *GRPCPool) Get(ctx context.Context, in *geecachepb.GetRequest) (*geecachepb.GetResponse, error) {
 	g := GetGroup(in.GetGroup())
 	if g == nil {
 		return nil, fmt.Errorf("no such group: %s", in.GetGroup())
@@ -28,8 +22,35 @@ func (s *grpcServer) Get(ctx context.Context, in *geecachepb.GetRequest) (*geeca
 	return &geecachepb.GetResponse{Value: view.ByteSlice()}, nil
 }
 
-// --- 2. 客户端（发射器）：负责向别人要数据 ---
-// 🌟 重点 2：就是这玩意！编译器说没找着它！
+func (p *GRPCPool) Set(ctx context.Context, in *geecachepb.SetRequest) (*geecachepb.SetResponse, error) {
+	g := GetGroup(in.GetGroup())
+	if g == nil {
+		return nil, fmt.Errorf("no such group: %s", in.GetGroup())
+	}
+
+	err := g.Set(in.GetKey(), in.GetValue())
+	if err != nil {
+		return &geecachepb.SetResponse{Success: false, Message: err.Error()}, nil
+	}
+	
+	return &geecachepb.SetResponse{Success: true}, nil
+}
+
+func (p *GRPCPool) Delete(ctx context.Context, in *geecachepb.DeleteRequest) (*geecachepb.DeleteResponse, error) {
+	g := GetGroup(in.GetGroup())
+	if g == nil {
+		return nil, fmt.Errorf("no such group: %s", in.GetGroup())
+	}
+	
+	err := g.Delete(in.GetKey())
+	if err != nil {
+		return &geecachepb.DeleteResponse{Success: false}, nil
+	}
+
+	return &geecachepb.DeleteResponse{Success: true}, nil
+}
+
+// --- 2. 客户端：负责向别人要数据 ---
 type grpcGetter struct {
 	addr string 
 }
@@ -48,7 +69,36 @@ func (g *grpcGetter) Get(in *geecachepb.GetRequest, out *geecachepb.GetResponse)
 	out.Value = resp.GetValue()
 	return nil
 }
+func (g *grpcGetter)Set(in *geecachepb.SetRequest,out *geecachepb.SetResponse)error{
+	conn,err := grpc.Dial(g.addr,grpc.WithInsecure())
+	if err != nil{
+		return err
+	}
+	defer conn.Close()
+	client := geecachepb.NewGroupCacheClient(conn)
+	resp,err := client.Set(context.Background(),in)
+	if err != nil{
+		return fmt.Errorf("could not set to peer %s: %v", g.addr, err)
+	}
+	out.Success = resp.GetSuccess()
+	out.Message = resp.GetMessage()
+	return nil
+}
 
+func (g *grpcGetter)Delete(in *geecachepb.DeleteRequest,out *geecachepb.DeleteResponse)error{
+	conn,err := grpc.Dial(g.addr,grpc.WithInsecure())
+	if err != nil{
+		return err
+	}
+	defer conn.Close()
+	client:= geecachepb.NewGroupCacheClient(conn)
+	resp,err := client.Delete(context.Background(),in)
+	if err != nil{
+		return fmt.Errorf("could not delete from peer %s: %v", g.addr, err)
+	}
+	out.Success=resp.GetSuccess()
+	return nil
+}
 // --- 3. 管理者：负责维护哈希地图和所有的客户端 ---
 
 type GRPCPool struct {
@@ -56,7 +106,7 @@ type GRPCPool struct {
 	self     string
 	mu          sync.Mutex
 	peers       *consistenthash.Map
-	httpGetters map[string]*grpcGetter // 🌟 这里用到了上面的 grpcGetter
+	httpGetters map[string]*grpcGetter
 }
 
 func NewGRPCPool(self string) *GRPCPool {
@@ -66,7 +116,7 @@ func NewGRPCPool(self string) *GRPCPool {
 	}
 }
 
-func (p *GRPCPool) Set(peers ...string) {
+func (p *GRPCPool) SetPeers(peers ...string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.peers = consistenthash.New(50, nil)
